@@ -225,7 +225,8 @@ class NanonisController(nanonis_programming_interface):
             name = from_binary(
                 'string', response['body'][cursor: cursor+name_size])
             if self.channel_name_filter(name):
-                names.append(name)
+                names.append((i,name))
+                # names.append(name)
             cursor += name_size
         return names
 
@@ -861,7 +862,117 @@ class NanonisController(nanonis_programming_interface):
 
 
 
+# programming by Quan Yang
+    def PSOnOffSet(self, q):
+        self.send('FolMe.PSOnOffSet', 'uint32', q)
+    def PSOnOffGet(self):
+        q = self.parse_response(self.send('FolMe.PSOnOffGet'), 'uint32')
+        return q
+    def PSPropsSet(self, ar):
+        self.send('FolMe.PSPropsSet', 'uint32', ar)
+    def PSPropsGet(self):
+        response = self.send('FolMe.PSPropsGet')
+        cursor = 0
+        Auto_resume = from_binary('uint32', response['body'][cursor: cursor+4])
+        cursor += 4
+        Use_own_basename = from_binary('uint32', response['body'][cursor: cursor+4])
+        cursor += 4
+        Basename_size = from_binary('int', response['body'][cursor: cursor+4])
+        cursor += 4
+        Basename = from_binary('string', response['body'][cursor: cursor+Basename_size])
+        cursor += Basename_size
+        # External_VI_path_size = from_binary('int', response['body'][cursor: cursor+4])
+        # cursor += 4
+        # External_VI_path = from_binary('string', response['body'][cursor: cursor+External_VI_path_size])
+        # cursor += External_VI_path_size
+        # Pre_measure_delay = from_binary('float32', response['body'][cursor: cursor+4])
+        # cursor += 4
+        return {
+            'Auto_resume': Auto_resume,
+            'Use_own_basename': Use_own_basename,
+            'Basename': Basename,
+            # 'External_VI_path': External_VI_path,
+            # 'Pre_measure_delay': Pre_measure_delay
+        }
+    # 有问题
+    def PSExpGet(self):
+        response = self.send('FolMe.PSExpGet')
+        cursor = 0
+        PS_experiment = from_binary('uint16', response['body'][cursor: cursor+2])
+        cursor += 2
+        size_of_experiments = from_binary('int', response['body'][cursor: cursor+4])
+        cursor += 4
+        number_of_experiments = from_binary('int', response['body'][cursor: cursor+4])
+        cursor += 4
+        list_of_experiments = []
+        i = 0
+        while i < number_of_experiments:
+            experiments = from_binary('string', response['body'][cursor: cursor+4])
+            cursor += 4
+            list_of_experiments += experiments
+            i += 1
+        return {
+            'PS_experiment': PS_experiment,
+            'number_of_experiments': number_of_experiments,
+            'list_of_experiments': list_of_experiments,
+            'size_of_experiments': size_of_experiments
+        }
+    # def PSExpSet(self):
+    #     self.send('FolMe.PSExpSet', 'uint16', 1)
+    def XYPosSet(self, x, y, wait=0):
+        self.send('FolMe.XYPosSet', 'float64', x, 'float64', y, 'uint32', wait)
+    def XYPosGet(self, wait=1):
+        xy_get = self.parse_response(self.send('FolMe.XYPosGet', 'uint32', wait), 'float64', 'float64')
+        return {
+            'x': xy_get['0'],
+            'y': xy_get['1']
+        }
+    def SpeedSet(self, speed, c_speed=1):
+        self.send('FolMe.SpeedSet', 'float32', speed, 'uint32', c_speed)
+    def SpeedGet(self):
+        speed = self.parse_response(self.send('FolMe.SpeedGet'), 'float32', 'uint32')
+        return {
+            'speed': speed['0'],
+            'c_speed': speed['1']
+        }
+    def ZPosGet(self):
+        z_position = self.parse_response(self.send('ZCtrl.ZPosGet'), 'float32')
+        return z_position
 
+    def SignalValsGet(self, signal_index, wait=0):
+        Signal_value = self.parse_response(self.send('Signals.ValGet', 'int', signal_index, 'uint32', wait), 'float32')
+        return Signal_value
+
+    def SignalsValsGet(self, signal_index_size, signal_index, wait=0):
+        response = self.send('Signals.ValsGet', 'int', signal_index_size, 'int', signal_index[0], 'int', signal_index[1], 'uint32', wait)
+        cursor = 0
+        Signals_values_size = from_binary('int', response['body'][cursor: cursor+4])
+        cursor += 4
+        Signals_values_list = []
+        i = 0
+        while i<Signals_values_size:
+            Signals_values = from_binary('float32', response['body'][cursor: cursor+4])
+            cursor += 4
+            Signals_values_list.append(Signals_values)
+            i+=1
+        return {
+            'size': Signals_values_size,
+            'value': Signals_values_list,
+        }
+    def LockinonoffSet(self, modulator_number=1, onoff=0):
+        self.send('LockIn.ModOnOffSet', 'int', modulator_number, 'uint32', onoff)
+    def LockInDemodHarmonicGet(self, Demodulator_number):
+        Harmonic = self.parse_response(self.send('LockIn.DemodHarmonicGet', 'int', Demodulator_number), 'int')
+        return Harmonic
+    def ZCtrlWithdraw(self,timeout, Wait=1):
+        self.send('ZCtrl.Withdraw', 'uint32', Wait, 'int', timeout)
+    def ZCtrlGainGet(self):
+        gain_get = self.parse_response(self.send('ZCtrl.GainGet'), 'float32', 'float32', 'float32')
+        return {
+            'P': gain_get['0'],
+            'T': gain_get['1'],
+            'I': gain_get['2']
+        }
 class Operate(metaclass=ABCMeta):
     '''
     The base class of all Operations.

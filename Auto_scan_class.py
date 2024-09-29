@@ -7,8 +7,14 @@ import shutil
 import sys
 import threading
 import time
+from math import sqrt
 from multiprocessing import Process, Queue
 
+from PyQt5.QtCore import QThread
+from matplotlib.animation import FuncAnimation
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+from core import NanonisController
 import cv2
 import keyboard
 import matplotlib.pyplot as plt
@@ -23,16 +29,36 @@ from PyQt_GUI import create_pyqt_app
 from tasks.LineScanchecker import *
 
 
+
 class  Mustard_AI_Nanonis(NanonisController):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.start_time = time.strftime('%Y-%m-%d %H-%M-%S',time.localtime(time.time()))    # record the start time of the scan
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        self.scan_start_time = None
+        self.total_scan_time = 0.0
+        self.per_scan_time = 0.0
+        self.ScandataQueue_1 = Queue(5)
+        self.tipdataQueue = Queue(5)
+        self.Tipshaper_signal = 0
+        self.iftipshaper = 0
         self.circle_list = []                       # the list to save the circle which importantly to the tip path
         self.circle_list_save = []                  # the list to save the circle as npy file
         self.nanocoodinate_list = []                # the list to save the coodinate which send to nanonis directly
         self.visual_circle_buffer_list = []
+
+        self.good_image_count = 0
+        self.count_choose = 100
+        self.frame_move_signal = 0
+        self.line_scan_signal = 0
+        self.scale_image_for = []
+        self.scale_image_back = []
+        self.scale_signal = 0
+        self.tippath_stop_event = threading.Event()
+        self.batch_stop_event = threading.Event()
+        self.savetip_stop_event = threading.Event()
+        self.linescan_stop_event = threading.Event()
+        self.mode = None
 
         self.trajectory_buffer_size = 5             # the size of the trajectory buffer
         self.trajectory_state_list = deque([], maxlen=self.trajectory_buffer_size)                   # the list to save the one step in memo
@@ -44,14 +70,14 @@ class  Mustard_AI_Nanonis(NanonisController):
         self.episode_count = 0                      # initialize the episode count to 0
         self.AdjustTip_flag = 0                     # 0: the tip is not adjusted, 1: the tip is adjusted just now
 
-        self.Scan_edge = "30n"                       # set the initial scan square edge length                           30pix  ==>>  30nm 
+        self.Scan_edge = '50n'                    # set the initial scan square edge length                           30pix  ==>>  30nm   80
         self.scan_square_Buffer_pix = 208            # scan pix
         self.plane_edge = "2u"                       # plane size repersent the area of the Scanable surface  2um*2um    2000pix  ==>>  2um
 
         self.Z_fixed_scan_time = 10                   # if the scan is after the Z fixed, how many seconds will the scan cost
         self.without_Z_fixed_scan_time = 10           # if the scan is without the Z fixed, how many seconds will the scan cost
-        self.linescan_max_min_threshold = '600p'      # the max and min threshold , if the line scan data is out of the threshold
-        self.scan_max_min_threshold = '1n'      # the max and min threshold , if the line scan data is out of the threshold
+        self.linescan_max_min_threshold = '10000p'      # the max and min threshold , if the line scan data is out of the threshold
+        self.scan_max_min_threshold = '10n'      # the max and min threshold , if the line scan data is out of the threshold
         self.len_threshold_list = 10
         self.threshold_list = deque([], maxlen=self.len_threshold_list)     # the list to save the threshold of the line scan data, if threshold_list is full with 1, the scan will be skiped
         self.skip_list = deque([], maxlen=10)         # the list to save the skip flag, if the skip_list is full with 1, gave the tip a aggressive tip shaper
@@ -205,7 +231,6 @@ class  Mustard_AI_Nanonis(NanonisController):
 
     # activate all the threads of monitor   
     def monitor_thread_activate(self):
-
         Safe_Tip_thread = threading.Thread(target=self.SafeTipthreading, args=('5n', 100),daemon=True)                                          # the SafeTipthrehold is 5n, the safe_withdraw_step is 100
         tip_visualization_thread = threading.Thread(target=self.tip_path_visualization, daemon=True)                                            # the tip path visualization thread
         batch_scan_consumer_thread = threading.Thread(target=self.batch_scan_consumer, daemon=True)                                             # the batch scan consumer thread
@@ -213,12 +238,28 @@ class  Mustard_AI_Nanonis(NanonisController):
         TipShaper_thread = threading.Thread(target=self.Tipshaperthreading, args=(self.PyQtTipShaperQueue,self.scanqulityqueue), daemon=True)   # the TipShaper thread
         instruct_thread = threading.Thread(target=self.instructthreading, args=(self.PyQtimformationQueue,), daemon=True)                       # the instruct thread
 
+        # if tip_visualization_thread.is_alive():
+        #     Safe_Tip_thread.join()
+        #     tip_visualization_thread.join()
+        #     batch_scan_consumer_thread.join()
+        #     self.tippath_stop_event = 0
+        #     self.batch_stop_event = 0
+        #     self.savetip_stop_event = 0
+        #     Safe_Tip_thread.start()
+        #     tip_visualization_thread.start()
+        #     batch_scan_consumer_thread.start()
+        # else:
+        #     Safe_Tip_thread.start()
+        #     tip_visualization_thread.start()
+        #     batch_scan_consumer_thread.start()
         Safe_Tip_thread.start()
         tip_visualization_thread.start()
         batch_scan_consumer_thread.start()
         Hand_Pulse_thread.start()
         TipShaper_thread.start()
         instruct_thread.start()
+
+
 
 
     def SafeTipthreading(self, SafeTipthrehold = '5n', safe_withdraw_step = 100):
@@ -228,7 +269,8 @@ class  Mustard_AI_Nanonis(NanonisController):
             SafeTipthrehold = self.convert(SafeTipthrehold)
 
         current_list = []
-        while True:
+        # while True:
+        while not self.savetip_stop_event.is_set():
             time.sleep(0.5)
             try:
                 current = self.CurrentGet()
@@ -314,7 +356,7 @@ class  Mustard_AI_Nanonis(NanonisController):
                 time.sleep(0.5)
                 self.ScanStart()
 
-    def batch_scan_producer(self, Scan_posion = (0.0 ,0.0), Scan_edge = "30n", Scan_pix = 304 ,  angle = 0):
+    def batch_scan_producer(self,  Scan_posion = (0.0 ,0.0), Scan_edge = "30n", Scan_pix = 304 ,  angle = 0, ):
         if self.skip_flag == 1:
             print('creating skip data...')
             Scan_data_for = {'data': np.ones((Scan_pix, Scan_pix), np.uint8) * 0.1,
@@ -333,17 +375,21 @@ class  Mustard_AI_Nanonis(NanonisController):
             print('Scaning the image...')
             # ScanBuffer = self.ScanBufferGet()
             self.ScanBufferSet(Scan_pix, Scan_pix, self.signal_channel_list) # 14 is the index of the Z_m channel in real scan mode , in demo mode, the index of the Z_m channel is 30
-            self.ScanPropsSet(Continuous_scan = 2 , Bouncy_scan = 2,  Autosave = 3, Series_name = ' ', Comment = 'inter_closest')# close continue_scan & bouncy_scan, but save all data
+            self.ScanPropsSet(Continuous_scan = 2 , Bouncy_scan = 2,  Autosave = 1, Series_name = ' ', Comment = 'inter_closest')# close continue_scan & bouncy_scan, but save all data
             self.ScanFrameSet(Scan_posion[0], Scan_posion[1], Scan_edge, Scan_edge, angle=angle)
 
             self.ScanStart()
-            time.sleep(0.5)
-
+            t = (self.ScanSpeedGet()['Forward time per line'] + self.ScanSpeedGet()[
+                'Backward time per line']) * \
+                self.ScanBufferGet()['Lines']
+            self.calculate_total_scan_time(t)
+            self.ScanStop()
+            # time.sleep(1)
             # while self.ScanStatusGet() == 1: # detect the scan status until the scan is complete.
             #     #   !!!   Note：Do not use self.WaitEndOfScan() here   !!!!, it will block the program!!!!!!
             #     time.sleep(0.5)
-            
-            self.WaitEndOfScan() # wait for the scan to be complete
+
+            # self.WaitEndOfScan() # wait for the scan to be complete
 
             try:   # some times the scan data is not successful because of the TCP/IP communication problem
                 Scan_data_for = self.ScanFrameData(self.signal_channel_list[-1], data_dir=1)
@@ -380,7 +426,10 @@ class  Mustard_AI_Nanonis(NanonisController):
 
         self.Scan_data = {'Scan_data_for':Scan_data_for, 'Scan_data_back':Scan_data_back}
 
-        self.ScandataQueue.put(self.Scan_data) # put the batch scan data into the queue, blocking if Queue is full
+        self.ScandataQueue.put(self.Scan_data)
+        time.sleep(0.5)
+        self.ScandataQueue_1.put(self.Scan_data)
+        # put the batch scan data into the queue, blocking if Queue is full
         print('Scaning complete! \n ready to save...')
         return self.Scan_data
 
@@ -391,13 +440,14 @@ class  Mustard_AI_Nanonis(NanonisController):
         self.ScanPropsSet(Continuous_scan = 1, Bouncy_scan = 1,  Autosave = 3, Series_name = ' ', Comment = 'LineScan')
         self.lineScanmode(3, angle=angle)
         Z_m_index = self.signal_channel_list[-1]
+
         self.ScanStart()
         self.WaitEndOfScan()
         while True:
             lineScandata = self.lineScanGet(Z_m_index)
             if self.lineScanQueue.full():
                 self.lineScanQueue.get()
-            if time.time() > end_time or self.skip_flag: # if the time is over or the scan is skiped, break the loop
+            if time.time() > end_time or self.skip_flag or self.linescan_stop_event.is_set(): # if the time is over or the scan is skiped, break the loop
                 self.lineScanQueue.put('end')
                 
                 if self.aggressive_tip_flag: # aggressive_tip_flag = 1 means the scan is skiped 5 times continuously, so that might be the super terable tip!
@@ -407,7 +457,6 @@ class  Mustard_AI_Nanonis(NanonisController):
                     self.BiasPulse(-6, width=0.05)
                     time.sleep(1)
                     self.aggressive_tip_flag = 0    # reset the aggressive_tip_flag
-                
                 break
 
             
@@ -428,7 +477,9 @@ class  Mustard_AI_Nanonis(NanonisController):
         if not os.path.exists(self.image_data_save_path):
             os.makedirs(self.image_data_save_path)
 
-        while True:
+        # while True:
+        while not self.batch_stop_event.is_set():
+            # time.sleep(1)
             if not self.ScandataQueue.empty():
                 Scan_data = self.ScandataQueue.get()
                 Scan_data_for = Scan_data['Scan_data_for']['data']
@@ -448,9 +499,6 @@ class  Mustard_AI_Nanonis(NanonisController):
                 image_data_save_path_back   = self.image_data_save_path + '/' + 'Scan_data_back'+ self.image_save_time +'.png'
                 equalization_save_path_for  = self.equalization_save_path + '/' + 'Scan_data_for'+ self.image_save_time +'.png'
                 equalization_save_path_back = self.equalization_save_path + '/' + 'Scan_data_back'+ self.image_save_time +'.png'
-                
-
-
 
                 cv2.imwrite(equalization_save_path_for, equalization_for)
                 cv2.imwrite(equalization_save_path_back, equalization_back)     # save the equalization image                
@@ -458,12 +506,12 @@ class  Mustard_AI_Nanonis(NanonisController):
                 np.save(npy_data_save_path_back, Scan_data_back, allow_pickle = True)
                 cv2.imwrite(image_data_save_path_for, image_for)                # save the image
                 cv2.imwrite(image_data_save_path_back, image_back)              # save the image
-                cv2.namedWindow('image_for', cv2.WINDOW_NORMAL)
-                cv2.namedWindow('image_back', cv2.WINDOW_NORMAL)
-                cv2.resizeWindow('image_for', 400, 400)
-                cv2.resizeWindow('image_back', 400, 400)
-                cv2.imshow('image_for', image_for)
-                cv2.imshow('image_back', image_back)
+                # cv2.namedWindow('image_for', cv2.WINDOW_NORMAL)
+                # cv2.namedWindow('image_back', cv2.WINDOW_NORMAL)
+                # cv2.resizeWindow('image_for', 400, 400)
+                # cv2.resizeWindow('image_back', 400, 400)
+                # cv2.imshow('image_for', image_for)
+                # cv2.imshow('image_back', image_back)
             cv2.waitKey(100)
             if cv2.waitKey(100) & 0xFF == ord('q'):
                 break
@@ -486,7 +534,7 @@ class  Mustard_AI_Nanonis(NanonisController):
 
             time.sleep(0.153) # wait for the line scan data to be collected
             if lineScandata_1 == 'end':                                                             # if the line scan data producer is over, stop the line scan data consumer than draw the line scan data
-                
+                self.line_scan_signal = 0
                 print('lineScan complete! ')
                 
                 break                                                                               # end the lineScan_data_consumer
@@ -526,19 +574,79 @@ class  Mustard_AI_Nanonis(NanonisController):
             if self.AdjustTip_flag == 1:
                 scan_continue_time = self.Z_fixed_scan_time
             else:
-                # scan_continue_time = self.without_Z_fixed_scan_time
                 scan_continue_time = -(1/200)*self.R**2 + 1.1*self.R
             print('Line scan will continue for {} seconds'.format(scan_continue_time))
             t1 = threading.Thread(target = self.lineScan_data_producer, args=(0, scan_continue_time), daemon=True)               # lunch the line scan data producer
             t2 = threading.Thread(target = self.lineScan_data_consumer, daemon=True)                                             # lunch the line scan data consumer
             t1.start()
             t2.start()
+            self.line_scan_signal = 1
             print('line scanning...')
             t1.join()
             t2.join()
 
     def tip_path_visualization(self):
+        if self.mode == 'new':
+            self.start_time = time.strftime('%Y-%m-%d %H-%M-%S', time.localtime(time.time()))
+            self.ScandataQueue_1 = Queue(5)
+            self.tipdataQueue = Queue(5)
+            self.circle_list = []  # the list to save the circle which importantly to the tip path
+            self.circle_list_save = []  # the list to save the circle as npy file
+            self.nanocoodinate_list = []  # the list to save the coodinate which send to nanonis directly
+            self.visual_circle_buffer_list = []
+            self.line_scan_change_times = 0  # initialize the line scan change times to 0
+            self.episode_count = 0  # initialize the episode count to 0
+            self.AdjustTip_flag = 0
+            self.len_threshold_list = 10
+            self.threshold_list = deque([],
+                                        maxlen=self.len_threshold_list)  # the list to save the threshold of the line scan data, if threshold_list is full with 1, the scan will be skiped
+            self.skip_list = deque([],
+                                   maxlen=10)  # the list to save the skip flag, if the skip_list is full with 1, gave the tip a aggressive tip shaper
+            self.skip_flag = 0  # 0: the scan is not skiped, 1: the scan is skiped
+            self.aggressive_tip_flag = 0
+            self.agent_upgrate = 1
+            self.log_path = self.main_data_save_path + '/' + self.start_time
+            self.memory_path = './DQN/memory/' + self.start_time
+            self.Scan_edge_SI = self.convert(self.Scan_edge)  # the scan edge in SI unit   Scan_edge_SI = 30 * 1e-9
 
+            self.scan_square_edge = int(
+                self.convert(self.Scan_edge) * 10 ** 9)  # the scan square edge in pix  scan_square_edge = 30
+
+            self.tip_path_img = np.ones((self.plane_size, self.plane_size, 3), np.uint8) * 255  # the tip path image
+
+
+            self.R_init = self.scan_square_edge - 1  # initialize the Radius of tip step
+            self.R_max = self.R_init * 3
+            self.R_step = int(0.5 * self.R_init)
+            self.R = self.R_init
+
+            # initialize the other parameters that appear in the function
+            self.Scan_data = {}  # the dictionary to save the scan data
+            self.image_for = None  # 2D nparray the image of the scan data, have been nomalized and linear background
+            self.image_back = None
+            self.equalization_for = None  # the equalization image of the image_for and image_back
+            self.equalization_back = None
+            self.image_for_tensor = None  # the tensor of the image, 4 dimension, [1, 1, 256, 256]
+            self.image_back_tensor = None
+            self.image_save_time = None  # when the image is saved in log
+            self.npy_data_save_path = self.log_path + '/' + 'npy'  # self.log_path = './log/' + self.start_time
+            self.image_data_save_path = self.log_path + '/' + 'image'
+            self.equalization_save_path = self.log_path + '/' + 'equalize'
+            self.segmented_image_path = None  # the path of the segmented image saving
+            self.nemo_nanocoodinate = None  # the nanocoodinate of the nemo point, the format is SI unit
+            self.coverage = None  # the moleculer coverage of the image
+            self.line_start_time = None
+            self.episode_start_time = None  # the start time of the episode
+
+            # initialize the queue, the Queue is used to communicate between different threads
+            self.lineScanQueue = Queue(5)  # lineScan_data_producer → lineScan_data_consumer
+            self.lineScanQueue_back = Queue(5)  # lineScan_data_consumer → lineScan_data_producer
+            self.ScandataQueue = Queue(5)  # batch_scan_producer → batch_scan_consumer
+
+            self.tippathvisualQueue = Queue(5)
+            self.scan_start_time = None
+            self.per_scan_time = 0
+            self.total_scan_time = 0
         square_color_hex = "#BABABA"                        # good image color
         square_bad_color_hex = "#FE5E5E"                    # bad image color
         line_color_hex = "#8AAEFA"                          # tip path line color
@@ -557,8 +665,8 @@ class  Mustard_AI_Nanonis(NanonisController):
         sample_bad_color = Hex_to_BGR(sample_bad_color_hex)
         line_color = Hex_to_BGR(line_color_hex)        
 
-        cv2.namedWindow('Tip Path', cv2.WINDOW_KEEPRATIO)
-        cv2.resizeWindow('Tip Path', 800, 800)
+        # cv2.namedWindow('Tip Path', cv2.WINDOW_KEEPRATIO)
+        # cv2.resizeWindow('Tip Path', 800, 800)
         
 
         # creat a 400*400 pix white image by numpy array
@@ -568,8 +676,9 @@ class  Mustard_AI_Nanonis(NanonisController):
         scan_border_right_bottom = round(self.plane_size/2 * (1 + self.real_scan_factor))
         cv2.rectangle(self.tip_path_img, (scan_border_left_top, scan_border_left_top), (scan_border_right_bottom, scan_border_right_bottom), scan_border_color, 10)
 
-        while True:
-
+        # while True:
+        while not self.tippath_stop_event.is_set():
+            time.sleep(1)
             if not self.tippathvisualQueue.empty():
                 circle = self.tippathvisualQueue.get()
 
@@ -626,11 +735,11 @@ class  Mustard_AI_Nanonis(NanonisController):
                 else:
                     raise ValueError('the circle data is not a point or a circle')
 
-                
-                cv2.imshow('Tip Path', self.tip_path_img)
-                
+                self.tipdataQueue.put(self.tip_path_img)
+                # cv2.imshow('Tip Path', self.tip_path_img)
 
-            
+
+
             cv2.waitKey(100)
 
     # def a function to move the tip to the next point, and append all data to the circle_list and nanocoodinate_list
@@ -681,6 +790,7 @@ class  Mustard_AI_Nanonis(NanonisController):
         print('The probability of the good image is ' + str(round(probability,2)))
         if probability > self.scan_qulity_threshold and self.skip_flag == 0 :  # 0.5 is the self.scan_qulity_threshold of the probability
             scan_qulity = 1 # good image
+            self.good_image_count +=1
         else:
             scan_qulity = 0 # bad image
 
@@ -769,7 +879,7 @@ class  Mustard_AI_Nanonis(NanonisController):
             # if the memory_path + '/' + episode_start_time is not exist, create the folder
             # episode_start_time = time.strftime('%H-%M-%S',time.localtime(time.time()))                                  # record the start time of the trajectory
             
-            self.nanonis_action_number = self.select_nanonis_action(self.image_for, select_mode = 'random')                              # implement the action which have the hightest Q value accordding to the image and policy_net
+            self.nanonis_action_number = self.select_nanonis_action(self.image_for, select_mode = 'agent')                              # implement the action which have the hightest Q value accordding to the image and policy_net
             
             if len(self.trajectory_state_list) == 0:
                 self.episode_start_time = time.strftime('%Y-%m-%d %H-%M-%S',time.localtime(time.time()))                                  # record the start time of the trajectory
@@ -838,7 +948,272 @@ class  Mustard_AI_Nanonis(NanonisController):
                 self.trajectory_action_list.clear()
                 self.trajectory_reward_list.clear()
                 self.trajectory_next_state_list.clear()
+    # def a function to pulse
+    def bias_pulse_set(self, width, bias, wait=True):
+        while True:
+            try:
+                # 检查是否两个队列都为空
+                if width is None and bias is None:
+                    break
+                # 如果队列有值，发送脉冲命令
+                if width is not None or bias is not None:
+                    self.send('Bias.Pulse', 'uint32', int(wait), 'float32', float(
+                        width), 'float32', float(bias), 'uint16', 0, 'uint16', 0)
+                    print(f"Pulse with voltage: {bias}V\n"
+                          f"Pulse with width:{width}m")
+                    bias = None
+                    width = None
 
+            except Exception as e:
+                # 处理异常，例如队列操作失败或send方法失败
+                print(f"An error occurred: {e}")
+                # 可以选择在这里退出循环，或者设置标志来通知其他部分的代码
+                break
+    # def a function to record the statues of scan
+    def controls_set(self, controls):
+        while True:
+            try:
+                # 检查是否两个队列都为空
+                if controls is None:
+                    break
+                # 如果队列有值，发送脉冲命令
+                if controls == 1:
+                    self.send('Scan.Action', 'uint16', controls, 'uint32', 0)
+                    print(f"programming stop")
+                    controls = None
+                elif controls == 2:
+                    self.send('Scan.Action', 'uint16', controls, 'uint32', 0)
+                    print(f"programming pause")
+                    controls = None
+                elif controls == 3:
+                    self.send('Scan.Action', 'uint16', controls, 'uint32', 0)
+                    print(f"programming resume")
+                    controls = None
+
+            except Exception as e:
+                # 处理异常，例如队列操作失败或send方法失败
+                print(f"An error occurred: {e}")
+                # 可以选择在这里退出循环，或者设置标志来通知其他部分的代码
+                break
+    # def a function to set the scan speed
+    def speed_set(self, time_per_frame):
+        Keep_parameter_constant = 2
+        Speed_ratio = 1
+        height = self.ScanBufferGet()['Lines']
+        time_per_line = time_per_frame/height/2
+        Forward_linear_speed = 1
+        Backward_linear_speed = 1
+        while True:
+            try:
+                # 检查是否两个队列都为空
+                if time_per_frame is None:
+                    break
+                # 如果队列有值，发送脉冲命令
+                if time_per_frame is not None:
+                    self.send('Scan.SpeedSet', 'float32', Forward_linear_speed, 'float32', Backward_linear_speed,
+                              'float32', time_per_line, 'float32', time_per_line, 'uint16',
+                              Keep_parameter_constant, 'float32', Speed_ratio)
+                    time_per_frame = None
+            except Exception as e:
+                # 处理异常，例如队列操作失败或send方法失败
+                print(f"An error occurred: {e}")
+                break
+    def z_position_adjust(self):
+        z_position = self.ZPosGet()
+        if z_position < -2.3E-7:
+            self.MotorMoveSet(4, 1)
+            z_position_change = self.ZPosGet()
+            q = 2.3E-7/(z_position_change - z_position)-1
+            self.MotorMoveSet(4, q)
+        elif z_position > 2.3E-7:
+            self.MotorMoveSet(5, 1)
+            z_position_change = self.ZPosGet()
+            q = 2.3E-7/(z_position - z_position_change)-1
+            self.MotorMoveSet(5, q)
+
+    def TipShaper_set(self, TipLift, Switch_Off_Delay=0.05, Lift_Time_1=0.1, Bias_Setting_Time=0.06,
+                  Lift_Time_2=0.06,  Lifting_Bias=-1.0, Lifting_Height='2n',
+                  End_Wait_Time=0.01, stepstotarget=10):
+
+        TipLift = self.try_convert(TipLift)
+        Lifting_Height = self.try_convert(Lifting_Height)
+
+        Origin_ScanStatus = self.ScanStatusGet()  # check the scan status
+        if Origin_ScanStatus == 1:
+            self.ScanPause()  # Pause the scan (not stop), if the scan is running
+
+        ZCtrl_status = self.ZCtrlOnOffGet()  # get current Z control status
+
+        Z_current = self.TipZGet()  # get current Z position
+
+        Bias_current = self.BiasGet()  # get current Bias
+
+        self.ZCtrlOnOffSet("off")  # close Z control
+
+        time.sleep(Switch_Off_Delay)  # wait for Switch_Off_Delay
+
+        # use for loop to simulate the uniform motion of the tip
+        for i in range(stepstotarget):
+            self.TipZSet(Z_current + (i + 1) * (TipLift / stepstotarget))  # set the new Z position
+
+            time.sleep(Lift_Time_1 / stepstotarget)  # wait for Lift_Time_1/stepstotarget time
+
+        time.sleep(1)
+
+        self.BiasSet(Lifting_Bias)  # set the new Bias
+
+        time.sleep(Bias_Setting_Time)  # wait for Bias_Setting_Time
+
+        # use for loop to simulate the uniform motion of the tip
+        for i in range(stepstotarget):
+            self.TipZSet(Z_current + TipLift + (i + 1) * (
+                        Lifting_Height - TipLift) / stepstotarget)  # set the new Z position → Lifting_Height
+
+            time.sleep(Lift_Time_2 / stepstotarget)  # wait for Lift_Time_2/stepstotarget time
+
+        time.sleep(1)
+        # self.Tipshaper_signal = 1 #set a signal while tipshaper
+        self.BiasSet(Bias_current)  # set the new Bias → Bias_current
+
+        time.sleep(End_Wait_Time)  # wait for End_Wait_Time
+
+        # reopen Z control or not?
+        if self.iftipshaper == 1:
+            x = self.ScanFrameGet()['center_x'] + 5E-8
+            y = self.ScanFrameGet()['center_y'] + 5E-8
+            self.ScanFrameSet(x, y, 5E-8, 5E-8, 0)
+            self.iftipshaper = 0
+        if ZCtrl_status == 1:
+            self.ZCtrlOnOffSet("on")
+        else:
+            self.ZCtrlOnOffSet("off")
+
+        if Origin_ScanStatus == 1:
+            self.ScanResume()  # Resume the scan (not restart), if the scan was running
+
+    # def a function to record pause_time while scan running
+    def calculate_total_scan_time(self, expected_total_time):
+        self.scan_start_time = None
+        self.per_scan_time = 0
+        self.total_scan_time = 0
+        while True:
+            status = self.ScanStatusGet()
+            if self.Tipshaper_signal == 1:
+                self.Tipshaper_signal = 0
+                break
+            elif self.frame_move_signal == 1:
+                self.frame_move_signal = 0
+                break
+            elif expected_total_time != self.current_time_per_frame():
+                break
+            elif status == 1:
+                if self.scan_start_time is None:
+                    self.scan_start_time = time.time()  # 记录扫描开始时间
+            elif status == 0:
+                if self.scan_start_time is not None:
+                    # 计算当前扫描周期的时间
+                    self.per_scan_time = time.time() - self.scan_start_time
+                    # 累加到总扫描时间
+                    self.total_scan_time += self.per_scan_time
+                    # 重置扫描开始时间和当前扫描时间
+                    self.scan_start_time = None
+                    self.per_scan_time = 0
+
+                    # 检查是否达到预期的总扫描时间
+                    if self.total_scan_time+3 >= expected_total_time:
+                        break
+                if self.scan_start_time is None:
+                    pass
+            # 每秒检查一次状态
+            time.sleep(2)
+    def current_time_per_frame(self):
+        true_t = (self.ScanSpeedGet()['Forward time per line'] + self.ScanSpeedGet()[
+            'Backward time per line']) * \
+            self.ScanBufferGet()['Lines']
+        return true_t
+
+    def Gainset(self, proportional, integral):
+        while True:
+            try:
+                if proportional is None and integral is None:
+                    break
+                if proportional is not None or integral is not None:
+                    self.send('ZCtrl.GainSet', 'float32', float(proportional), 'float32', float(
+                        proportional/integral), 'float32', float(integral))
+                    print(f"P-gain set: {proportional}pm\n"
+                          f"I-gain set:{integral}pm/s")
+                    proportional = None
+                    integral = None
+
+            except Exception as e:
+                print(f"An error occurred: {e}")
+                break
+    def get_current_value(self):
+        q = self.SignalsValsGet(2, (0, 30))
+        return q['value']
+    # function to get current and z
+    def plot_realtime_current(self, fig_max_len=500, update_interval=10):
+        xdata, ydata = deque(maxlen=fig_max_len), deque(maxlen=fig_max_len)
+        fig, ax = plt.subplots(figsize=(10,6))
+        ln, = ax.plot(xdata, ydata, animated=True)
+        ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.3f'))
+        ax.set_ylabel('Current (pA)')
+        ax.set_title('Real-time Current Measurement')
+
+        # 更新图表
+        def update(frame):
+            current_value = abs(self.get_current_value()[0])*1E+12
+            xdata.append(frame)
+            ydata.append(current_value)
+            ax.set_xlim(max(0, frame - fig_max_len), frame+1)
+            ax.set_ylim(min(ydata), max(ydata))
+            ln.set_data(xdata, ydata)
+            return ln,
+
+        ani = FuncAnimation(fig, update, interval=update_interval, blit=True)
+
+        plt.show()
+
+    def plot_realtime_z(self, fig_max_len=500):
+        xdata, ydata = deque(maxlen=fig_max_len), deque(maxlen=fig_max_len)
+        fig, ax = plt.subplots(figsize=(10,6))
+        ln, = ax.plot(xdata, ydata, animated=True)
+        ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.3f'))
+        ax.set_ylabel('Z(m)')
+        ax.set_title('Real-time Z Measurement')
+
+        def update(frame):
+            current_value = abs(self.get_current_value()[1]) * 1E+12
+            xdata.append(frame)
+            ydata.append(current_value)
+            ax.set_xlim(max(0, frame - fig_max_len), frame + 1)
+            ax.set_ylim(min(ydata), max(ydata))
+            ln.set_data(xdata, ydata)
+            return ln,
+
+        ani = FuncAnimation(fig, update, interval=10, blit=True)
+        plt.show()
+
+    def if_fix_tip(self):
+        self.iftipshaper = 1
+    def bias_pulse(self):
+        self.send('Bias.Pulse', 'uint32', int(True), 'float32', float(5E-2), 'float32', float(-2), 'uint16', 0,
+                          'uint16', 0)
+    def move_to_next_area(self):
+        self.ScanStop()
+        self.ScanFrameSet(0, 0, 5E-8, 5E-8)
+        self.ZCtrlWithdraw(1)
+        time.sleep(0.5)
+        self.MotorMoveSet('Z-', 100)
+        time.sleep(0.5)
+        self.MotorMoveSet('X-', 10)
+        time.sleep(0.5)
+        self.MotorMoveSet('Y-', 10)
+        # self.nanonis.ZCtrlOnOffSet(1)
+        self.AutoApproachOpen()
+        time.sleep(0.5)
+        self.AutoApproachSet()
+        print("area move succeed, wait for auto approach")
 
 if __name__ == '__main__':
     nanonis = Mustard_AI_Nanonis()
@@ -848,6 +1223,7 @@ if __name__ == '__main__':
     nanonis.DQN_init(mode = 'new') # deflaut mode is 'latest' mode = 'new' : create a new model, mode = 'latest' : load the latest checkpoint    
 
     nanonis.monitor_thread_activate()                                                # activate the monitor thread
+
 
     while tip_in_boundary(nanonis.inter_closest, nanonis.plane_size, nanonis.real_scan_factor):
         
